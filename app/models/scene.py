@@ -24,7 +24,7 @@ class Scene(Base):
 
     triggers = relationship("Trigger", back_populates="scene", cascade="all, delete-orphan")
     actions = relationship("Action", back_populates="scene", cascade="all, delete-orphan")
-    execution_logs = relationship("ExecutionLog", back_populates="scene")
+    execution_logs = relationship("ExecutionLog", back_populates="scene", cascade="all, delete-orphan")
 
 
 class Trigger(Base):
@@ -67,7 +67,7 @@ class ExecutionLog(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     scene_id = Column(Integer, ForeignKey("scenes.id"), nullable=False)
-    trigger_id = Column(Integer, ForeignKey("triggers.id"))
+    trigger_id = Column(Integer, ForeignKey("triggers.id", ondelete="SET NULL"))
     execution_id = Column(String(50), nullable=False)
     status = Column(String(30), nullable=False)
     started_at = Column(DateTime, default=datetime.utcnow)

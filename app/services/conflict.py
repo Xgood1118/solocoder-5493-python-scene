@@ -66,20 +66,30 @@ class ConflictDetector:
     async def check_offline_devices(
         self, scene: Scene,
     ) -> ConflictResult:
-        offline_devices = []
-        self._collect_device_ids(scene, offline_devices)
+        device_ids = []
+        self._collect_device_ids(scene, device_ids)
 
+        not_exist = []
         offline = []
-        for device_id in offline_devices:
-            if not device_manager.is_device_online(device_id):
+        for device_id in device_ids:
+            device = device_manager.get_device(device_id)
+            if not device:
+                not_exist.append(device_id)
+            elif not device.is_online:
                 offline.append(device_id)
 
+        messages = []
+        if not_exist:
+            messages.append(f"以下设备不存在: {not_exist}")
         if offline:
+            messages.append(f"以下设备离线，执行时将跳过: {offline}")
+
+        if not_exist or offline:
             return ConflictResult(
                 has_conflict=True,
-                conflict_type="offline_devices",
-                message=f"以下设备离线，执行时将跳过: {offline}",
-                conflicting_scene_ids=offline,
+                conflict_type="offline_devices" if offline else "missing_devices",
+                message="; ".join(messages),
+                conflicting_scene_ids=not_exist + offline,
             )
         return ConflictResult(has_conflict=False)
 

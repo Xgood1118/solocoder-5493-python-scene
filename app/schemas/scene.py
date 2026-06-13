@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 from pydantic import BaseModel, Field, ConfigDict
 
 
@@ -143,7 +143,7 @@ class DeviceCommand(BaseModel):
 class ConflictCheckResult(BaseModel):
     has_conflict: bool
     conflict_type: Optional[str] = None
-    conflicting_scenes: List[int] = Field(default_factory=list)
+    conflicting_scenes: List[Union[int, str]] = Field(default_factory=list)
     message: Optional[str] = None
 
 

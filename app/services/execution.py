@@ -27,6 +27,8 @@ class ExecutionEngine:
         trigger_source: str = "api",
         dry_run: bool = False,
     ) -> ExecutionLog:
+        await self._cleanup_stale_running_logs()
+
         execution_id = str(uuid.uuid4())[:8]
         log = ExecutionLog(
             scene_id=scene.id,
@@ -39,38 +41,15 @@ class ExecutionEngine:
             is_debug=scene.debug_mode or dry_run,
         )
         db.add(log)
-
-        conflict_result = await self.conflict_detector.check_priority_interrupt(db, scene)
-        if conflict_result and conflict_result.interrupted_scene_id:
-            interrupted = await db.get(Scene, conflict_result.interrupted_scene_id)
-            if interrupted:
-                for eid, task in list(self._running_executions.items()):
-                    if eid.startswith(f"scene_{interrupted.id}_"):
-                        task.cancel()
-                        try:
-                            await task
-                        except asyncio.CancelledError:
-                            pass
-
-                int_log = ExecutionLog(
-                    scene_id=interrupted.id,
-                    execution_id=str(uuid.uuid4())[:8],
-                    status="interrupted",
-                    trigger_type="priority_interrupt",
-                    started_at=datetime.utcnow(),
-                    completed_at=datetime.utcnow(),
-                    interrupted_by=scene.id,
-                    interrupt_reason=f"被高优先级场景 [{scene.name}](priority={scene.priority}) 打断",
-                )
-                db.add(int_log)
-
         await db.commit()
         await db.refresh(log)
+
+        interrupted_scene_id = await self._handle_priority_interrupt(scene)
 
         scene_id = scene.id
         log_id = log.id
         task = asyncio.create_task(
-            self._run_actions(scene_id, log_id, dry_run)
+            self._run_actions(scene_id, log_id, dry_run, interrupted_scene_id)
         )
         self._running_executions[f"scene_{scene.id}_{execution_id}"] = task
 
@@ -82,11 +61,72 @@ class ExecutionEngine:
 
         return log
 
+    async def _cleanup_stale_running_logs(self):
+        running_keys = set(self._running_executions.keys())
+        async with async_session() as db:
+            result = await db.execute(
+                select(ExecutionLog).where(ExecutionLog.status == "running")
+            )
+            stale_logs = result.scalars().all()
+            for log in stale_logs:
+                key_prefix = f"scene_{log.scene_id}_"
+                is_actually_running = any(k.startswith(key_prefix) for k in running_keys)
+                if not is_actually_running:
+                    log.status = "interrupted"
+                    log.completed_at = datetime.utcnow()
+                    log.interrupt_reason = "执行异常中断（进程重启或任务丢失）"
+            await db.commit()
+
+    async def _handle_priority_interrupt(
+        self, scene: Scene
+    ) -> Optional[int]:
+        async with async_session() as check_db:
+            conflict_result = await self.conflict_detector.check_priority_interrupt(check_db, scene)
+        if not conflict_result or not conflict_result.interrupted_scene_id:
+            return None
+
+        interrupted_scene_id = conflict_result.interrupted_scene_id
+
+        for eid, task in list(self._running_executions.items()):
+            if eid.startswith(f"scene_{interrupted_scene_id}_"):
+                task.cancel()
+                self._running_executions.pop(eid, None)
+
+        async with async_session() as int_db:
+            result = await int_db.execute(
+                select(ExecutionLog).where(
+                    ExecutionLog.scene_id == interrupted_scene_id,
+                    ExecutionLog.status == "running",
+                )
+            )
+            running_logs = result.scalars().all()
+            for rlog in running_logs:
+                rlog.status = "interrupted"
+                rlog.completed_at = datetime.utcnow()
+                rlog.interrupted_by = scene.id
+                rlog.interrupt_reason = f"被高优先级场景 [{scene.name}](priority={scene.priority}) 打断"
+
+            int_log = ExecutionLog(
+                scene_id=interrupted_scene_id,
+                execution_id=str(uuid.uuid4())[:8],
+                status="interrupted",
+                trigger_type="priority_interrupt",
+                started_at=datetime.utcnow(),
+                completed_at=datetime.utcnow(),
+                interrupted_by=scene.id,
+                interrupt_reason=f"被高优先级场景 [{scene.name}](priority={scene.priority}) 打断",
+            )
+            int_db.add(int_log)
+            await int_db.commit()
+
+        return interrupted_scene_id
+
     async def _run_actions(
         self,
         scene_id: int,
         log_id: int,
         dry_run: bool,
+        interrupted_scene_id: Optional[int] = None,
     ):
         async with async_session() as db:
             action_results: List[Dict[str, Any]] = []
@@ -121,22 +161,31 @@ class ExecutionEngine:
                 log.action_results = action_results
 
             except asyncio.CancelledError:
-                log = await db.get(ExecutionLog, log_id)
-                if log:
-                    log.status = "interrupted"
-                    log.completed_at = datetime.utcnow()
-                    log.interrupt_reason = "被高优先级场景打断"
-                    log.action_results = action_results
+                try:
+                    clog = await db.get(ExecutionLog, log_id)
+                    if clog and clog.status == "running":
+                        clog.status = "interrupted"
+                        clog.completed_at = datetime.utcnow()
+                        clog.interrupt_reason = "被高优先级场景打断"
+                        clog.action_results = action_results
+                        await db.commit()
+                except Exception:
+                    pass
+                raise
 
             except Exception as e:
-                log = await db.get(ExecutionLog, log_id)
-                if log:
-                    log.status = "failed"
-                    log.completed_at = datetime.utcnow()
-                    log.error_message = str(e)[:500]
-                    log.action_results = action_results
+                try:
+                    elog = await db.get(ExecutionLog, log_id)
+                    if elog:
+                        elog.status = "failed"
+                        elog.completed_at = datetime.utcnow()
+                        elog.error_message = str(e)[:500]
+                        elog.action_results = action_results
+                        await db.commit()
+                except Exception:
+                    pass
 
-            finally:
+            else:
                 await db.commit()
 
     async def _execute_action(
@@ -236,7 +285,18 @@ class ExecutionEngine:
                 "skipped": True,
             }
 
-        if not device_manager.is_device_online(device_id):
+        device = device_manager.get_device(device_id)
+        if not device:
+            return {
+                "action_id": action.id,
+                "device_id": device_id,
+                "action_type": "device_command",
+                "success": False,
+                "skipped": True,
+                "message": f"设备 [{device_id}] 不存在，已跳过",
+            }
+
+        if not device.is_online:
             return {
                 "action_id": action.id,
                 "device_id": device_id,

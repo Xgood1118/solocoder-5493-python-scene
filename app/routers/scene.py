@@ -189,6 +189,13 @@ async def delete_scene(scene_id: int, db: AsyncSession = Depends(get_db)):
         if t.trigger_type == "cron":
             await trigger_engine.remove_cron_trigger(t.id)
 
+    result = await db.execute(
+        select(ExecutionLog).where(ExecutionLog.scene_id == scene_id)
+    )
+    for log in result.scalars().all():
+        await db.delete(log)
+    await db.flush()
+
     await db.delete(scene)
     await db.commit()
     return {"message": "场景已删除"}
